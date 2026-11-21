@@ -36,26 +36,27 @@ model = model.to(device, non_blocking=True)
 optimizer = torch.optim.AdamW([
     {
         "params": model.c_heads.parameters(),
-        "lr": 5e-5,
-        "weight_decay": 1e-2,
+        "lr": 3e-4,
+        "weight_decay": 1e-3,
     },
     {
         "params": model.rt_heads.parameters(),
-        "lr": 1e-3,
-        "weight_decay": 1e-3,
+        "lr": 2e-3,
+        "weight_decay": 1e-2,
     },
 ])
 criterion_c, criterion_rt = (
     nn.CrossEntropyLoss(label_smoothing=0.05),
     nn.CrossEntropyLoss(),
 )
-patience_limit = 3 # recommended 20% of num epochs
+patience_limit = 1 # recommended 20% of num epochs
+elemination_patience = 2
 EPOCHS = 15
 snapshots = []
-best_c_loss = 0.0
-rt_temp_loss = 0.0
+best_c_loss = float('inf')
+rt_temp_loss = float('inf')
 head_patience = {
-    'rt_heads':{name:{"best_loss":float("-inf"), "patience":0} for name in model.rt_heads.keys()}
+    'rt_heads': {name: {"best_loss": float("inf"), "patience": 0} for name in model.rt_heads.keys()}
 }
 for epoch in range(EPOCHS):
     training_loss_c, training_loss_rt = 0.0, 0.0
@@ -67,10 +68,10 @@ for epoch in range(EPOCHS):
         label = label.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits_c, logits_rt = model(image)
+        logits_c, rt_logits,rt_features = model(image)
 
         loss_c = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
-        loss_rt = sum(criterion_rt(head, label) for head in logits_rt) / len(logits_rt)
+        loss_rt = gvnr.compute_rt_loss(rt_logits,rt_features,label,criterion_rt)
 
         loss_c.backward()
         loss_rt.backward()
@@ -102,15 +103,15 @@ for epoch in range(EPOCHS):
             image = image.to(device, non_blocking=True)
             label = label.to(device, non_blocking=True)
 
-            logits_c, logits_rt = model(image)
+            logits_c, rt_logits,rt_features = model(image)
 
             loss_c = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
-            loss_rt = sum(criterion_rt(head, label) for head in logits_rt) / len(logits_rt)
+            loss_rt = gvnr.compute_rt_loss(rt_features,rt_logits,label,criterion_rt)
 
             val_loss_c_sum += loss_c.item()
             val_loss_rt_sum += loss_rt.item()
 
-            stacked_logits = torch.stack(logits_c,dim=0)
+            stacked_c_logits = torch.stack(logits_c,dim=0)
             mean_logits_c = stacked_c_logits.mean(dim=0)
 
             preds = mean_logits_c.argmax(dim=1)
@@ -135,32 +136,72 @@ for epoch in range(EPOCHS):
     )
 
     # layer pruning & addition, alongside per-layer performance tracking
-    sample_x,sample_target = val_loader.dataset[torch.randint(0,len(val_loader.dataset),(1,)).item()]
+    sample_x, sample_target = val_loader.dataset[torch.randint(0, len(val_loader.dataset), (1,)).item()]
+    sample_x = sample_x.unsqueeze(0).to(device)
+    sample_target = torch.tensor([sample_target], device=device)
     epoch_metrics = model.eval_head(sample_x,sample_target,criterion_c,criterion_rt)
     model, head_patience = gvnr.clean_model(model,epoch_metrics,head_patience,snapshots,patience_limit=patience_limit)
 
+    rt_losses = epoch_metrics['rt_heads']
+    sorted_rt = sorted(rt_losses.items(),key=lambda item: item[1])
+
     # snapshotting
-    if (epoch+1)>=int(EPOCHS*0.2):
+    if (epoch+1)>=int(EPOCHS*0.2) and len(sorted_rt) >= 2:
         c_vals = epoch_metrics["c_heads"].values()
         mean_c_loss = sum(c_vals) / len(c_vals) 
-        if mean_c_loss>best_c_loss:
+        if mean_c_loss<best_c_loss:
             best_c_loss=mean_c_loss
             avg_weights = model.get_c_avg()
             snapshots.append(avg_weights)
 
             # Get the best 2 RT heads
-            rt_losses = epoch_metrics['rt_heads']
-            sorted_rt = sorted(rt_losses.items(),key=lambda item: item[1]) # sort by loss 
-            best_idx,second_best_idx = sorted_rt[0][1], sorted_rt[1][1]
+            best_idx, best_loss = sorted_rt[0]
+            second_best_idx, second_best_loss = sorted_rt[1]
             rt1_ss, rt2_ss = model.rt_heads[best_idx], model.rt_heads[second_best_idx]
-            snapshots.append(rt1_ss.state_dict(),rt2_ss.state_dict())
+            snapshots.extend([rt1_ss.state_dict(),rt2_ss.state_dict()])
 
     # C heads using RT findings
     # ⚠️⚠️ Temporary ⚠️⚠️ TO DO: Add Governor functionality
     # Temporary logic: If RT loss drops more than 10% add it to C weights
-    for head in model.c_heads.values():
-        c_sd = head.state_dict()
-        first_loss_rt, first_idx_rt = sorted_rt[0]
-        if rt_temp_loss*1.1>first_loss_rt:
-            combined_weights = 0.65*c_sd+0.35*models.rt_heads[first_idx_rt].state_dict()
-            head.load_state_dict(combined_weights)
+    # Runway for 'breakthroughs'
+    if len(sorted_rt) > 0:
+        first_idx_rt, first_loss_rt = sorted_rt[0]
+        if 'runway_counter' not in head_patience:
+            head_patience['runway_counter'] = 0
+            head_patience['best_candidate_sd'] = None
+
+        if first_loss_rt < rt_temp_loss * 0.9: # 10% improvement (20% was overly optimistic)
+            head_patience['runway_counter'] += 1
+            rt_temp_loss = first_loss_rt
+            head_patience['best_candidate_sd'] = model.rt_heads[first_idx_rt].state_dict()
+            
+            tqdm.write(f"RT Head breakthrough detected, Runway progress: {head_patience['runway_counter']}/3")
+        else:
+            pass
+        if head_patience['runway_counter'] >= 3:
+            tqdm.write(f"RT Head cleared 3-epoch runway, consolidating weights into C heads.")
+            rt_sd = head_patience['best_candidate_sd']
+            
+            for head in model.c_heads.values():
+                c_sd = head.state_dict()
+                combined_weights = {}
+                for key in c_sd:                
+                    if key in rt_sd and c_sd[key].shape == rt_sd[key].shape and c_sd[key].is_floating_point():
+                        combined_weights[key] = 0.65 * c_sd[key] + 0.35 * rt_sd[key] # Linear weight consolidation2
+                    else:                        
+                        combined_weights[key] = c_sd[key]
+                        
+                head.load_state_dict(combined_weights)
+            
+            head_patience['runway_counter'] = 0
+            head_patience['best_candidate_sd'] = None
+
+    # Pruning the bottom 25% every few epochs
+    if (epoch+1)%elemination_patience==0:
+        rt_count= int(len(model.rt_heads.keys())/4)
+        sorted_rt = reversed(sorted_rt)
+        indicies,_ = sorted_rt[:rt_count]
+
+        for idx in indicies:
+            model.remove_rt(idx)
+

@@ -16,7 +16,7 @@ def average_weights(state_dicts):
     return avg_state_dict
 
 class RTHead(nn.Module):
-    def __init__(self, out_dim: int = 128):
+    def __init__(self, out_dim: int = 200):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(3, 48, kernel_size=3, stride=1, padding=1, bias=False),
@@ -36,11 +36,11 @@ class RTHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.net(x)
         pooled = F.adaptive_avg_pool2d(feat, 1).flatten(1)
-        return F.silu(self.proj(pooled))
+        return (F.silu(self.proj(pooled)), pooled)
 
 
 class CHead(nn.Module):
-    def __init__(self, out_dim: int = 384):
+    def __init__(self, out_dim: int = 200):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
@@ -133,6 +133,13 @@ class MultiHead(nn.Module):
 
     def forward(self,x):
         c_out = [head_c(x) for head_c in self.c_heads.values()]
-        rt_out = [head_rt(x) for head_rt in self.rt_heads.values()]
-        return c_out,rt_out
+
+        rt_logits = []
+        rt_features = []
+
+        for head in self.rt_heads.values():
+            logits,feat = head(x)
+            rt_logits.append(logits)
+            rt_features.append(feat)
+        return c_out,rt_logits,rt_features # This is to accomodate for the new diversity loss feature
 

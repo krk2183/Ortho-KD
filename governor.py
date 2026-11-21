@@ -24,6 +24,32 @@ class Governor(nn.Module):
                 model.add_rt(snapshots)
         return model, head_patience
     
-    def select_rt(self):
-        return 0
+    def compute_rt_loss(self,rt_features_list, rt_logits_list, targets, criterion):
+        """
+        rt_features_list: list of pooled feature tensors from each RT head [batch_size, hidden_dim]
+        rt_logits_list: list of final logit tensors from each RT head [batch_size, out_dim]
+        """
+        task_losses = [criterion(logits, targets) for logits in rt_logits_list]
+        total_task_loss = sum(task_losses) / len(task_losses)
+        
+        innovator_feat = rt_features_list[0]
+        follower_feats = rt_features_list[1:]
+        
+        diversity_loss = 0.0
+        if len(follower_feats) > 0:
+            innovator_norm = F.normalize(innovator_feat, dim=1)
+            
+            for f_feat in follower_feats:
+                f_norm = F.normalize(f_feat, dim=1)
+                cosine_sim = (innovator_norm * f_norm).sum(dim=1).mean()
+                
+
+                diversity_loss += torch.abs(cosine_sim)
+                
+            diversity_loss = diversity_loss / len(follower_feats)
+            
+        lambda_div = 0.1 # how aggressively they must differ
+        total_loss = total_task_loss + (lambda_div * diversity_loss)
+        
+        return total_loss
 
