@@ -58,11 +58,14 @@ for epoch in range(EPOCHS):
     )
     optimizer.zero_grad(set_to_none=True)
     logits_c, logits_rt = model(image)
-    loss_c, loss_rt = criterion_c(logits_c, label), criterion_rt(
-        logits_rt, label
-    )
-
-    (loss_c + loss_rt).backward()
+    # loss_c, loss_rt = criterion_c(logits_c, label), criterion_rt(
+        # logits_rt, label
+    # )
+    loss_c = sum(criterion_c(head,label) for head in logits_c) / len(logits_c)
+    loss_rt = sum(criterion_rt(head,label) for head in logits_rt)/ len(logits_rt)
+    # (loss_c + loss_rt).backward()
+    loss_c.backward()
+    loss_rt.backward()
     optimizer.step()
 
     training_loss_c += loss_c.item()
@@ -82,14 +85,16 @@ for epoch in range(EPOCHS):
           device, non_blocking=True
       )
       logits_c, logits_rt = model(image)
-      loss_c, loss_rt = criterion_c(logits_c, label), criterion_rt(
-          logits_rt, label
-      )
+    #   loss_c, loss_rt = criterion_c(logits_c, label), criterion_rt(
+        #   logits_rt, label
+    #   )
+      loss_c = sum(criterion_c(head,label) for head in logits_c)/len(logits_c)
+      loss_rt = sum(criterion_rt(head,label) for head in logits_rt)/len(logits_rt)
 
       val_loss_c_sum += loss_c.item()
       val_loss_rt_sum += loss_rt.item()
 
-      preds = (logits_c + logits_rt).argmax(dim=1)
+      preds = (logits_c).argmax(dim=1)
       correct += (preds == label).sum().item()
       total += label.size(0)
 
