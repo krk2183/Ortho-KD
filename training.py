@@ -53,9 +53,9 @@ patience_limit = 3 # recommended 20% of num epochs
 EPOCHS = 15
 snapshots = []
 best_c_loss = 0.0
-
+rt_temp_loss = 0.0
 head_patience = {
-    'rt_heads':{name:{"best_loss":float("-inf"), "patience":0} for name in model.rt_heads.key()}
+    'rt_heads':{name:{"best_loss":float("-inf"), "patience":0} for name in model.rt_heads.keys()}
 }
 for epoch in range(EPOCHS):
     training_loss_c, training_loss_rt = 0.0, 0.0
@@ -72,7 +72,8 @@ for epoch in range(EPOCHS):
         loss_c = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
         loss_rt = sum(criterion_rt(head, label) for head in logits_rt) / len(logits_rt)
 
-        (loss_c + loss_rt).backward()
+        loss_c.backward()
+        loss_rt.backward()
         optimizer.step()
 
         training_loss_c += loss_c.item()
@@ -95,7 +96,7 @@ for epoch in range(EPOCHS):
         desc=f"Epoch [{epoch + 1:02d}/{EPOCHS:02d}] Val  ",
         leave=False,
     )
-
+    # Validation loop
     with torch.no_grad():
         for step, (image, label) in enumerate(val_pbar, start=1):
             image = image.to(device, non_blocking=True)
@@ -109,7 +110,10 @@ for epoch in range(EPOCHS):
             val_loss_c_sum += loss_c.item()
             val_loss_rt_sum += loss_rt.item()
 
-            preds = logits_c.argmax(dim=1)
+            stacked_logits = torch.stack(logits_c,dim=0)
+            mean_logits_c = stacked_c_logits.mean(dim=0)
+
+            preds = mean_logits_c.argmax(dim=1)
             correct += (preds == label).sum().item()
             total += label.size(0)
 
@@ -151,3 +155,12 @@ for epoch in range(EPOCHS):
             rt1_ss, rt2_ss = model.rt_heads[best_idx], model.rt_heads[second_best_idx]
             snapshots.append(rt1_ss.state_dict(),rt2_ss.state_dict())
 
+    # C heads using RT findings
+    # ⚠️⚠️ Temporary ⚠️⚠️ TO DO: Add Governor functionality
+    # Temporary logic: If RT loss drops more than 10% add it to C weights
+    for head in model.c_heads.values():
+        c_sd = head.state_dict()
+        first_loss_rt, first_idx_rt = sorted_rt[0]
+        if rt_temp_loss*1.1>first_loss_rt:
+            combined_weights = 0.65*c_sd+0.35*models.rt_heads[first_idx_rt].state_dict()
+            head.load_state_dict(combined_weights)
