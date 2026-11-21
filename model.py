@@ -98,13 +98,38 @@ class MultiHead(nn.Module):
 
     def add_rt(self,snapshots):
         snapshot_mean = average_weights(snapshots) # In either 2:1 or 3:1 ratio (RT to C)
-        # Init layer and load_state_dict()
         rt_layer = RTHead()
-        rt_layer = rt_layer.load_state_dict(snapshot_mean)
+        rt_layer.load_state_dict(snapshot_mean)
         new_idx = int(next(reversed(self.rt_heads)))+1
         self.rt_heads[str(new_idx)] = rt_layer
+
     def remove_rt(self,idx):
         del self.rt_heads[idx]
+
+    @torch.no_grad()
+    def eval_head(self,x,targets,criterion_c,criterion_rt):
+        perf_metrics = {
+            "c_heads":{},
+            'rt_heads':{}
+        }
+
+        for idx,head in self.c_heads.items():
+            outputs = head(x)
+            loss = criterion_c(outputs,targets).item()
+            perf_metrics['c_heads'][idx] = loss
+        
+        for idx,head in self.rt_heads.items():
+            outputs = head(x)
+            loss = criterion_rt(outputs,targets).item()
+            perf_metrics['rt_heads'][idx] = loss
+        
+        return perf_metrics
+    
+    @torch.no_grad()
+    def get_c_avg(self):
+        states = [head.state_dict() for head in model.c_heads.values()]
+        avg_weights = average_weights(states)
+        return avg_weights
 
     def forward(self,x):
         c_out = [head_c(x) for head_c in self.c_heads.values()]
