@@ -42,3 +42,15 @@ Traditional multi-head architectures typically rely on a massive shared backbone
 - **Drug Discovery & Molecular Design:** Highly effective for stationary-rule domains involving radical innovation. The lightweight `RTHeads` excel at exploring radical chemical space configurations and structural mutations, while online learning rewards high-value conformations before distilling them into stable core predictors.
 - **High-Performance Computer Vision:** Suitable for fine-grained recognition tasks where independent backbones capture complementary spatial hierarchies.
 - **Materials Discovery and Atomistic Modeling:** Replacing convolutional backbones with Equivariant Graph Neural Networks (GNNs) will allow the model to better learn orthogonal physical manifolds.
+
+## How to train the model
+To install the required libraries
+
+```bash
+pip install -r requirements.txt
+```
+To train the model using the default configuration:
+
+```bash
+python training.py
+```
