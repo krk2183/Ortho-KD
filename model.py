@@ -115,12 +115,12 @@ class MultiHead(nn.Module):
         }
 
         for idx,head in self.c_heads.items():
-            outputs = head(x)
+            outputs,_ = head(x)
             loss = criterion_c(outputs,targets).item()
             perf_metrics['c_heads'][idx] = loss
         
         for idx,head in self.rt_heads.items():
-            outputs = head(x)
+            outputs,_ = head(x)
             loss = criterion_rt(outputs,targets).item()
             perf_metrics['rt_heads'][idx] = loss
         

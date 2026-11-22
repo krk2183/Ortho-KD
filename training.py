@@ -11,11 +11,17 @@ from governor import Governor
 
 torch.backends.cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+patience_limit = 1 # recommended 20% of num epochs
+elemination_patience = 2
+EPOCHS = 80
+NUM_C,NUM_RT = 4,16
+
 gvnr = Governor()
 
 train_transform = transforms.Compose([
     transforms.ToTensor(),
-    transforms.RandomResizeCrop(64,scale=(0.5,1.0)),
+    transforms.RandomResizedCrop(64,scale=(0.5,1.0)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -34,10 +40,8 @@ val_dataset = TinyImageNet(data_dir, split="val", transform=val_transform)
 train_loader = DataLoader(train_dataset, batch_size=24, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False)
 
-""""
-IMPLEMENT: state_dict saving (snapshots) in 3:1/2:1 ratio
-"""
-model = MultiHead(n_c=4, n_rt=16, out_dim=200)
+
+model = MultiHead(n_c=NUM_C, n_rt=NUM_RT, out_dim=200)
 model = model.to(device, non_blocking=True)
 
 optimizer = torch.optim.AdamW([
@@ -58,9 +62,6 @@ criterion_c, criterion_rt = (
 )
 
 scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=EPOCHS, T_mult=1, eta_min=1e-6)
-patience_limit = 1 # recommended 20% of num epochs
-elemination_patience = 2
-EPOCHS = 80
 snapshots = []
 best_c_loss = float('inf')
 rt_temp_loss = float('inf')
@@ -73,15 +74,15 @@ for epoch in range(EPOCHS):
     train_pbar = tqdm(train_loader,desc=f"Epoch [{epoch + 1:02d}/{EPOCHS:02d}] Train",leave=False,)
 
     for step, (image, label) in enumerate(train_pbar, start=1):
+        
         image = image.to(device, non_blocking=True)
         label = label.to(device, non_blocking=True)
-
         optimizer.zero_grad(set_to_none=True)
         logits_c,features_c, rt_logits,rt_features = model(image)
 
         loss_c_base = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
         loss_c = loss_c_base + (0.05 * gvnr.c_diversity(features_c))
-        loss_rt = gvnr.compute_rt_loss(rt_logits,rt_features,label,criterion_rt)
+        loss_rt = gvnr.compute_rt_loss(rt_features, rt_logits, label, criterion_rt)
 
         loss_c.backward()
         loss_rt.backward()
@@ -116,7 +117,7 @@ for epoch in range(EPOCHS):
             logits_c,features_c, rt_logits,rt_features = model(image)
 
             loss_c = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
-            loss_rt = gvnr.compute_rt_loss(rt_features,rt_logits,label,criterion_rt)
+            loss_rt = gvnr.compute_rt_loss(rt_features, rt_logits, label, criterion_rt)
 
             val_loss_c_sum += loss_c.item()
             val_loss_rt_sum += loss_rt.item()
@@ -178,7 +179,7 @@ for epoch in range(EPOCHS):
             head_patience['runway_counter'] = 0
             head_patience['best_candidate_sd'] = None
         # If RT loss drops more than 10% add it to C weights
-        if first_loss_rt < rt_temp_loss * 0.9: # (20% was overly optimistic)
+        if first_loss_rt < rt_temp_loss * 0.9 and (epoch+1)>=int(EPOCHS*0.05): # (20% was overly optimistic)
             head_patience['runway_counter'] += 1
             rt_temp_loss = first_loss_rt
             head_patience['best_candidate_sd'] = model.rt_heads[first_idx_rt].state_dict()
@@ -220,12 +221,12 @@ for epoch in range(EPOCHS):
             head_patience['best_candidate_idx'] = None
 
     # Pruning the bottom 25% every n epochs
-    if (epoch+1)%elemination_patience==0:
-        rt_count= int(len(model.rt_heads.keys())/4)
-        sorted_rt = reversed(sorted_rt)
-        indicies,_ = sorted_rt[:rt_count]
+    if (epoch+1)%elemination_patience==0 and len(sorted_rt) > 0:
+        rt_count = max(1, int(len(model.rt_heads) / 4))
+        worst_rt = sorted_rt[-rt_count:]
+        indices_to_remove = [idx for idx, loss in worst_rt]
 
-        for idx in indicies:
+        for idx in indices_to_remove:
             model.remove_rt(idx)
 
     scheduler.step()

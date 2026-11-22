@@ -9,7 +9,7 @@ class Governor(nn.Module):
     def clean_model(self,model,epoch_metrics,head_patience,snapshots,patience_limit=3):
         for name in model.rt_heads.keys():
             if name not in head_patience['rt_heads']:
-                head_patience['rt_heads'][name] = {'best_loss':float('-inf'), "patience":0}
+                head_patience['rt_heads'][name] = {'best_loss':float('inf'), "patience":0}
             loss,state = epoch_metrics['rt_heads'][name], head_patience['rt_heads'][name]
 
             if loss<state['best_loss']:
@@ -37,10 +37,10 @@ class Governor(nn.Module):
         
         diversity_loss = 0.0
         if len(follower_feats) > 0:
-            innovator_norm = F.normalize(innovator_feat, dim=1)
+            innovator_norm = F.normalize(innovator_feat, dim=1, eps=1e-8)
             
             for f_feat in follower_feats:
-                f_norm = F.normalize(f_feat, dim=1)
+                f_norm = F.normalize(f_feat, dim=1, eps=1e-8)
                 cosine_sim = (innovator_norm * f_norm).sum(dim=1).mean()
                 
 
@@ -70,10 +70,10 @@ class Governor(nn.Module):
 
     # Might be slow
     def c_diversity(self,c_features_list,lambda_c_div=0.05): # Must also implement state space sim
-        if len(c_features_list) <= 1:
-            return torch.tensor(0.0, device=c_features_list[0].device)
+        if not c_features_list or len(c_features_list) <= 1:
+            return torch.tensor(0.0, device=c_features_list[0].device if c_features_list else 'cpu')
     
-        normalized_feats = [F.normalize(feat, dim=1) for feat in c_features_list]
+        normalized_feats = [F.normalize(feat, dim=1, eps=1e-8) for feat in c_features_list]
         total_sim = 0.0
         pairs = 0
         #compute pairwise sim for every unique combo of C heads
@@ -83,4 +83,4 @@ class Governor(nn.Module):
                 total_sim += cosine_sim
                 pairs += 1
                 
-        return total_sim / max(pairs, 1) # avg pairwise overlap (to be minimized)
+        return (total_sim / max(pairs, 1)) * lambda_c_div # avg pairwise overlap (to be minimized)
