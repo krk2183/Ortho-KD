@@ -53,3 +53,34 @@ class Governor(nn.Module):
         
         return total_loss
 
+    def kd_loss(self,s_logits_list,t_logits,labels,criterion,alpha=0.5,temperature=4.0):
+        total_kd = 0.0
+        with torch.no_grad():
+            soft_t = F.softmax(t_logits/temperature,dim=1)
+
+        for s_logits in s_logits_list:
+            ce_loss = criterion(s_logits,labels)
+            soft_s = F.log_softmax(s_logits/temperature,dim=1)
+            kl_loss = F.kl_div(soft_s,soft_t,reduction='batchmean')
+
+            head_loss = alpha*ce_loss+(1-alpha)*kl_loss
+            total_kd+=head_loss
+        
+        return total_kd/len(s_logits_list)
+
+    # Might be slow
+    def c_diversity(self,c_features_list,lambda_c_div=0.05): # Must also implement state space sim
+        if len(c_features_list) <= 1:
+            return torch.tensor(0.0, device=c_features_list[0].device)
+    
+        normalized_feats = [F.normalize(feat, dim=1) for feat in c_features_list]
+        total_sim = 0.0
+        pairs = 0
+        #compute pairwise sim for every unique combo of C heads
+        for i in range(len(normalized_feats)):
+            for j in range(i + 1, len(normalized_feats)):
+                cosine_sim = (normalized_feats[i] * normalized_feats[j]).sum(dim=1).abs().mean()
+                total_sim += cosine_sim
+                pairs += 1
+                
+        return total_sim / max(pairs, 1) # avg pairwise overlap (to be minimized)

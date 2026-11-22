@@ -2,6 +2,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torchvision import transforms
 from tqdm.auto import tqdm
 from model import MultiHead
@@ -12,17 +13,23 @@ torch.backends.cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gvnr = Governor()
 
-transform = transforms.Compose([
+train_transform = transforms.Compose([
     transforms.ToTensor(),
+    transforms.RandomResizeCrop(64,scale=(0.5,1.0)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+val_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
 data_dir = Path("./data/tinyimagenet")
 
-train_dataset = TinyImageNet(data_dir, split="train", transform=transform)
-val_dataset = TinyImageNet(data_dir, split="val", transform=transform)
+train_dataset = TinyImageNet(data_dir, split="train", transform=train_transform)
+val_dataset = TinyImageNet(data_dir, split="val", transform=val_transform)
 
 train_loader = DataLoader(train_dataset, batch_size=24, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False)
@@ -36,22 +43,24 @@ model = model.to(device, non_blocking=True)
 optimizer = torch.optim.AdamW([
     {
         "params": model.c_heads.parameters(),
-        "lr": 3e-4,
-        "weight_decay": 1e-3,
+        "lr": 5e-4,
+        "weight_decay": 5e-4,
     },
     {
         "params": model.rt_heads.parameters(),
-        "lr": 2e-3,
-        "weight_decay": 1e-2,
+        "lr": 3e-3,
+        "weight_decay": 5e-3,
     },
 ])
 criterion_c, criterion_rt = (
     nn.CrossEntropyLoss(label_smoothing=0.05),
     nn.CrossEntropyLoss(),
 )
+
+scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=EPOCHS, T_mult=1, eta_min=1e-6)
 patience_limit = 1 # recommended 20% of num epochs
 elemination_patience = 2
-EPOCHS = 15
+EPOCHS = 80
 snapshots = []
 best_c_loss = float('inf')
 rt_temp_loss = float('inf')
@@ -68,9 +77,10 @@ for epoch in range(EPOCHS):
         label = label.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        logits_c, rt_logits,rt_features = model(image)
+        logits_c,features_c, rt_logits,rt_features = model(image)
 
-        loss_c = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
+        loss_c_base = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
+        loss_c = loss_c_base + (0.05 * gvnr.c_diversity(features_c))
         loss_rt = gvnr.compute_rt_loss(rt_logits,rt_features,label,criterion_rt)
 
         loss_c.backward()
@@ -103,7 +113,7 @@ for epoch in range(EPOCHS):
             image = image.to(device, non_blocking=True)
             label = label.to(device, non_blocking=True)
 
-            logits_c, rt_logits,rt_features = model(image)
+            logits_c,features_c, rt_logits,rt_features = model(image)
 
             loss_c = sum(criterion_c(head, label) for head in logits_c) / len(logits_c)
             loss_rt = gvnr.compute_rt_loss(rt_features,rt_logits,label,criterion_rt)
@@ -154,49 +164,62 @@ for epoch in range(EPOCHS):
             avg_weights = model.get_c_avg()
             snapshots.append(avg_weights)
 
-            # Get the best 2 RT heads
+            # get the best 2 RT heads
             best_idx, best_loss = sorted_rt[0]
             second_best_idx, second_best_loss = sorted_rt[1]
             rt1_ss, rt2_ss = model.rt_heads[best_idx], model.rt_heads[second_best_idx]
             snapshots.extend([rt1_ss.state_dict(),rt2_ss.state_dict()])
-
-    # C heads using RT findings
-    # ⚠️⚠️ Temporary ⚠️⚠️ TO DO: Add Governor functionality
-    # Temporary logic: If RT loss drops more than 10% add it to C weights
-    # Runway for 'breakthroughs'
+    
+    # KD on RT findings (KD doesn't assume linear mode connectivity, which hurt performance. More in the README)
     if len(sorted_rt) > 0:
         first_idx_rt, first_loss_rt = sorted_rt[0]
+        
         if 'runway_counter' not in head_patience:
             head_patience['runway_counter'] = 0
             head_patience['best_candidate_sd'] = None
-
-        if first_loss_rt < rt_temp_loss * 0.9: # 10% improvement (20% was overly optimistic)
+        # If RT loss drops more than 10% add it to C weights
+        if first_loss_rt < rt_temp_loss * 0.9: # (20% was overly optimistic)
             head_patience['runway_counter'] += 1
             rt_temp_loss = first_loss_rt
             head_patience['best_candidate_sd'] = model.rt_heads[first_idx_rt].state_dict()
-            
-            tqdm.write(f"RT Head breakthrough detected, Runway progress: {head_patience['runway_counter']}/3")
+            head_patience['best_candidate_idx'] = first_idx_rt
+            tqdm.write(f"RT Head breakthrough found, runway progress: {head_patience['runway_counter']}/3")
         else:
             pass
-        if head_patience['runway_counter'] >= 3:
-            tqdm.write(f"RT Head cleared 3-epoch runway, consolidating weights into C heads.")
+        
+        if head_patience['runway_counter'] >= 3: # If runway is passed
+            tqdm.write(f"RT runway cleared, running KD into C heads.")
             rt_sd = head_patience['best_candidate_sd']
+            teacher_idx = head_patience['best_candidate_idx']
+            teacher_rt = model.rt_heads[teacher_idx]
+            teacher_rt.eval()
+
+            model.train()
+            for kd_step, (kd_img,kd_lbl) in enumerate(train_loader):
+                if kd_step>30: # optimization window, might need adjustment
+                    break
+                
+                kd_img = kd_img.to(device,non_blocking=True)
+                kd_lbl = kd_lbl.to(device,non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
             
-            for head in model.c_heads.values():
-                c_sd = head.state_dict()
-                combined_weights = {}
-                for key in c_sd:                
-                    if key in rt_sd and c_sd[key].shape == rt_sd[key].shape and c_sd[key].is_floating_point():
-                        combined_weights[key] = 0.65 * c_sd[key] + 0.35 * rt_sd[key] # Linear weight consolidation2
-                    else:                        
-                        combined_weights[key] = c_sd[key]
-                        
-                head.load_state_dict(combined_weights)
-            
+                with torch.no_grad():
+                    teacher_out = teacher_rt(kd_img)
+                    teacher_logits = teacher_out[0] if isinstance(teacher_out,tuple) else teacher_out # In case changed in the future
+                
+                logits_c,features_c, _, _ = model(kd_img)
+
+                kd_loss = gvnr.kd_loss(logits_c,teacher_logits,kd_lbl,criterion_c,alpha=0.5,temperature=4.0)
+
+                kd_loss.backward()
+                optimizer.step()
+
             head_patience['runway_counter'] = 0
             head_patience['best_candidate_sd'] = None
+            head_patience['best_candidate_idx'] = None
 
-    # Pruning the bottom 25% every few epochs
+    # Pruning the bottom 25% every n epochs
     if (epoch+1)%elemination_patience==0:
         rt_count= int(len(model.rt_heads.keys())/4)
         sorted_rt = reversed(sorted_rt)
@@ -205,3 +228,4 @@ for epoch in range(EPOCHS):
         for idx in indicies:
             model.remove_rt(idx)
 
+    scheduler.step()

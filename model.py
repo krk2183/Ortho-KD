@@ -74,14 +74,15 @@ class CHead(nn.Module):
             )
         return nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         h = self.stem(x)
         for stage in (self.stage1, self.stage2, self.stage3, self.stage4):
             for block in stage:
                 residual = block[0](h) if block[0].stride != (1, 1) or block[0].in_channels != block[0].out_channels else h
                 h = F.silu(residual + block(h))
         pooled = F.adaptive_avg_pool2d(h, 1).flatten(1)
-        return self.proj(pooled)
+        logits = self.proj(pooled)
+        return logits, pooled  
 
 
 class MultiHead(nn.Module):
@@ -132,14 +133,20 @@ class MultiHead(nn.Module):
         return avg_weights
 
     def forward(self,x):
-        c_out = [head_c(x) for head_c in self.c_heads.values()]
-
+        # c_out = [head_c(x) for head_c in self.c_heads.values()]
+        c_logits = []
+        c_features = []
         rt_logits = []
         rt_features = []
 
+        for head in self.c_heads.values():
+            logits,feat = head(x)
+            c_logits.append(logits)
+            c_features.append(feat)
         for head in self.rt_heads.values():
             logits,feat = head(x)
             rt_logits.append(logits)
             rt_features.append(feat)
-        return c_out,rt_logits,rt_features # This is to accomodate for the new diversity loss feature
+            
+        return c_logits,c_features,rt_logits,rt_features # This is to accomodate for the new diversity loss feature & KD
 
